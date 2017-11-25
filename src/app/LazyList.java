@@ -1,100 +1,208 @@
+/*
+ * LazyList.java
+ *
+ * Created on January 4, 2006, 1:41 PM
+ *
+ * From "Multiprocessor Synchronization and Concurrent Data Structures",
+ * by Maurice Herlihy and Nir Shavit.
+ * Copyright 2006 Elsevier Inc. All rights reserved.
+ */
+
 package app;
 
-import java.util.concurrent.atomic.AtomicMarkableReference;
+/**
+ * Lazy list implementation: lock-free contains method.
+ * 
+ * @param T
+ *            Item type.
+ * @author Maurice Herlihy
+ */
+public class LazyList<T extends Comparable<T>> {
+	/**
+	 * First list Node
+	 */
+	private Node<T> head;
 
-public class LazyList<T> {
-    
-    Node<T> head;
+	/**
+	 * Constructor
+	 */
+	public LazyList() {
+		// Add sentinels to start and end
+		this.head = new Node<>(Integer.MIN_VALUE);
+		this.head.next = new Node<>(Integer.MAX_VALUE);
+	}
 
-    public LazyList() {
-        head = new Node<>(Integer.MIN_VALUE);
-        Node<T> tail = new Node<>(Integer.MAX_VALUE);
-        while(head.next.compareAndSet(null, tail, false, false));
-    }
+	/**
+	 * Check that prev and curr are still in list and adjacent
+	 */
+	private boolean validate(Node<T> pred, Node<T> curr) {
+		return !pred.marked && !curr.marked && pred.next == curr;
+	}
 
-    public boolean add(T item) {
-        int key = item.hashCode();
-        while(true) {
-            Window<T> window = this.find(head, key);
-            Node<T> pred = window.prev;
-            Node<T> curr = window.curr;
-            if(curr.key == key) {
-            	return false;
-            } else {
-            	Node<T> node = new Node<>(item);
-            	node.next = new AtomicMarkableReference<Node<T>>(curr, false);
-            	if(pred.next.compareAndSet(curr, node, false, false)) {
-            		return true;
-            	}
-            }
-        }
-    }
-    
-    public boolean remove(T item) {
-    	int key = item.hashCode();
-    	boolean snip;
-    	while(true) {
-    		Window<T> window = find(head, key);
-    		Node<T> pred = window.prev;
-    		Node<T> curr = window.curr;
-    		if(curr.key != key) {
-    			return false;
-    		} else {
-    			Node<T> succ = curr.next.getReference();
-    			snip = curr.next.attemptMark(succ, true);
-    			if(!snip)
-    				continue;
-    			pred.next.compareAndSet(curr, succ, false, false);
-    			return true;
-    		}
-    	}
-    }
-    
-    public boolean contains(T item) {
-    	int key = item.hashCode();
-    	Window<T> window = find(head, key);
-    	Node<T> curr = window.curr;
-    	return curr.key == key;
-    }
-    
-    public boolean replace(T previous, T next) {
-    	// TODO: implement method
-    	return false;
-    }
-    
-    @Override
-	public synchronized String toString() {
-		StringBuilder sb = new StringBuilder();
-		Node<T> curr = head.next.getReference();
-		sb.append('[');
-		while(curr.item != null) {
-			sb.append(curr.item.toString() + ", ");
-			curr = curr.next.getReference();
+	private boolean validateReplace(Node<T> pred, Node<T> curr) {
+		return !pred.marked && !curr.marked && pred.next == curr && !pred.tagged && !curr.tagged;
+	}
+	
+	/**
+	 * Add an element.
+	 * 
+	 * @param item
+	 *            element to add
+	 * @return true iff element was not there already
+	 */
+	public boolean add(T item) {
+		int key = item.hashCode();
+		while (true) {
+			Node<T> pred = this.head;
+			Node<T> curr = head.next;
+			while (curr.key < key) {
+				pred = curr;
+				curr = curr.next;
+			}
+			pred.lock();
+			try {
+				curr.lock();
+				try {
+					if (validate(pred, curr)) {
+						if (curr.key == key) { // present
+							return false;
+						} else { // not present
+							Node<T> Node = new Node<>(item);
+							Node.next = curr;
+							pred.next = Node;
+							return true;
+						}
+					}
+				} finally { // always unlock
+					curr.unlock();
+				}
+			} finally { // always unlock
+				pred.unlock();
+			}
 		}
+	}
+
+	private boolean add(T item, boolean tag) {
+		int key = item.hashCode();
+		while (true) {
+			Node<T> pred = this.head;
+			Node<T> curr = head.next;
+			while (curr.item.compareTo(item) < 0) {
+				pred = curr;
+				curr = curr.next;
+			}
+			pred.lock();
+			try {
+				curr.lock();
+				try {
+					if (validateReplace(pred, curr)) {
+						if (curr.key == key) { // present
+							return false;
+						} else { // not present
+							Node<T> Node = new Node<>(item, tag);
+							Node.next = curr;
+							pred.next = Node;
+							return true;
+						}
+					}
+				} finally { // always unlock
+					curr.unlock();
+				}
+			} finally { // always unlock
+				pred.unlock();
+			}
+		}
+	}
+	
+	/**
+	 * Remove an element.
+	 * 
+	 * @param item
+	 *            element to remove
+	 * @return true iff element was present
+	 */
+	public boolean remove(T item) {
+		int key = item.hashCode();
+		while (true) {
+			Node<T> pred = this.head;
+			Node<T> curr = head.next;
+			while (curr.key < key) {
+				pred = curr;
+				curr = curr.next;
+			}
+			pred.lock();
+			try {
+				curr.lock();
+				try {
+					if (validate(pred, curr)) {
+						if (curr.key != key) { // present
+							return false;
+						} else { // absent
+							curr.marked = true; // logically remove
+							pred.next = curr.next; // physically remove
+							return true;
+						}
+					}
+				} finally { // always unlock curr
+					curr.unlock();
+				}
+			} finally { // always unlock pred
+				pred.unlock();
+			}
+		}
+	}
+	
+	public boolean replace(T oldItem, T newItem) {
+		boolean changed = add(newItem, true);
+		changed = changed | remove(oldItem);
+		int key = newItem.hashCode();
+		while(true) {
+			Node<T> pred = this.head;
+			Node<T> curr = head.next;
+			while(curr.key != key) {
+				pred = curr;
+				curr = curr.next;
+			}
+			pred.lock();
+			try {
+				curr.lock();
+				try {
+					curr.tagged = false;
+					return changed;
+				} finally {
+					curr.unlock();
+				}
+			} finally {
+				pred.unlock();
+			}
+		}
+	}
+
+	/**
+	 * Test whether element is present
+	 * 
+	 * @param item
+	 *            element to test
+	 * @return true iff element is present
+	 */
+	public boolean contains(T item) {
+		int key = item.hashCode();
+		Node<T> curr = this.head;
+		while (curr.key < key)
+			curr = curr.next;
+		return curr.key == key && !curr.marked && !curr.tagged;
+	}
+
+	@Override
+	public synchronized String toString() {
+		Node<T> ptr = head.next;
+		StringBuilder sb = new StringBuilder("[ ");
+		while (ptr.item != null) {
+			sb.append(ptr.item.toString() + " ");
+			ptr = ptr.next;
+		}
+		sb.append("]");
 		return sb.toString();
 	}
 
-	public Window<T> find(Node<T> head, int key) {
-        Node<T> pred = null, curr = null, succ = null;
-        boolean[] marked = { false }; // is curr marked?
-        boolean snip;
-retry:  while(true) {
-            pred = head;
-            curr = pred.next.getReference();
-            while(true) {
-                succ = curr.next.get(marked);
-                while(marked[0]) { // replace curr if marked
-                    snip = pred.next.compareAndSet(curr, succ, false, false);
-                    if(!snip)
-                        continue retry;
-                    curr = pred.next.getReference();
-                    succ = curr.next.get(marked);
-                }
-                if(curr.key >= key)
-                    return new Window<T>(pred, curr);
-                pred = curr;
-                curr = succ;
-            }
-        }
-    }
 }
